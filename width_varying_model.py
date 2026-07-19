@@ -9,23 +9,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from lm_engine.lm_engine.hf_models.register_hf import (
+from lm_engine.hf_models.register_hf import (
     _CUSTOM_MODEL_REGISTRY,
     register_model_classes,
 )
-from lm_engine.lm_engine.hf_models.models.gpt_base.base import GPTBaseModel
-from lm_engine.lm_engine.hf_models.mixins.dense.layer import Block
-from lm_engine.lm_engine.hf_models.mixins.modeling_outputs import BaseModelOutputWithPast
-from lm_engine.lm_engine.hf_models.models.gpt_base.main import GPTBaseForCausalLM
-from lm_engine.lm_engine.hf_models.cache import GenerationCache
-from lm_engine.lm_engine.hf_models.modeling_utils.linear import ParameterizedLinear
-from lm_engine.lm_engine.hf_models.modeling_utils.normalization import get_normalization_function
-from lm_engine.lm_engine.hf_models.modeling_utils.position_embedding.rope import RoPE
-from lm_engine.lm_engine.hf_models.modeling_utils import ParameterizedEmbedding
-from lm_engine.lm_engine.hf_models.utils import is_generation_cache_enabled
-from lm_engine.lm_engine.hf_models.parameter import mark_parameter_as_mup_learning_rate
-from lm_engine.lm_engine.utils import log_rank_0
+from lm_engine.hf_models.models.gpt_base.base import GPTBaseModel
+from lm_engine.hf_models.mixins.dense.layer import Block
+from lm_engine.hf_models.mixins.modeling_outputs import BaseModelOutputWithPast
+from lm_engine.hf_models.models.gpt_base.main import GPTBaseForCausalLM
+from lm_engine.hf_models.cache import GenerationCache
+from lm_engine.hf_models.modeling_utils.linear import ParameterizedLinear
+from lm_engine.hf_models.modeling_utils.normalization import get_normalization_function
+from lm_engine.hf_models.modeling_utils.position_embedding.rope import RoPE
+from lm_engine.hf_models.modeling_utils import ParameterizedEmbedding
+from lm_engine.hf_models.utils import is_generation_cache_enabled
+from lm_engine.hf_models.parameter import mark_parameter_as_mup_learning_rate
+from lm_engine.utils import log_rank_0
 
+from attention_grouping import (
+    AttentionGroupDispatchPlan,
+    AttentionGroupRouter,
+    GroupedSelfAttention,
+)
 from width_varying_config import WidthVaryingConfig
 
 
@@ -34,8 +39,23 @@ class WidthVaryingBlock(Block):
         self,
         config: WidthVaryingConfig,
         use_padding_free_transformer: bool,
+        sequence_parallel: bool = False,
         layer_idx: int | None = None,
     ) -> Block:
+        """Initialize one variable-width transformer block.
+
+        Args:
+            config (WidthVaryingConfig): Model configuration.
+            use_padding_free_transformer (bool): Whether inputs use packed tokens.
+            sequence_parallel (bool): Whether tensor-parallel sequence sharding is active.
+            layer_idx (int | None): Zero-based transformer layer index.
+
+        Returns:
+            Block: Initialized block.
+        """
+
+        if layer_idx is None:
+            raise ValueError("WidthVaryingBlock requires layer_idx")
         orig_hidden_size = config.hidden_size
         orig_initializer_range = config.initializer_range
         self.hidden_size = config.widths[layer_idx]
@@ -51,7 +71,12 @@ class WidthVaryingBlock(Block):
                 orig_hidden_size / config.hidden_size
             )
 
-        super().__init__(config, use_padding_free_transformer, layer_idx)
+        super().__init__(
+            config,
+            use_padding_free_transformer,
+            layer_idx,
+            sequence_parallel,
+        )
 
         config.hidden_size = orig_hidden_size
         config.initializer_range = orig_initializer_range
@@ -66,6 +91,35 @@ class WidthVaryingBlock(Block):
             self.rope_dim, max_position_embeddings=max_position_embeddings, base=config.rope_theta
         )
         self.use_padding_free_transformer = use_padding_free_transformer
+        self.uses_attention_groups = layer_idx < config.attention_group_num_layers
+
+        if self.uses_attention_groups:
+            if use_padding_free_transformer or sequence_parallel:
+                raise ValueError(
+                    "attention grouping currently requires padded, non-sequence-parallel pretraining"
+                )
+            if self.sequence_mixer_type != "softmax_attention":
+                raise ValueError("attention grouping requires softmax_attention blocks")
+            dense_attention = self.sequence_mixer
+            if dense_attention.global_num_heads != dense_attention.global_num_key_value_heads:
+                raise ValueError("attention grouping currently requires standard multi-head attention")
+            if dense_attention.sliding_window is not None:
+                raise ValueError("attention grouping does not support sliding-window attention")
+            if dense_attention.attention_gate or dense_attention.exclusive_self_attention:
+                raise ValueError("attention grouping does not support attention gates or XSA")
+            self.attention_group_router_std = float(dense_attention.c_attn.std)
+            self.sequence_mixer = GroupedSelfAttention(
+                hidden_size=self.hidden_size,
+                num_groups=config.attention_num_groups,
+                group_heads=config.attention_group_heads_per_layer[layer_idx],
+                head_dim=self.rope_dim,
+                attention_multiplier=dense_attention.attention_multiplier,
+                add_bias=dense_attention.add_bias,
+                softmax_dropout=dense_attention.softmax_dropout_p,
+                dropout=dense_attention.dropout.p,
+                qkv_std=float(dense_attention.c_attn.std),
+                out_std=float(dense_attention.c_proj.std),
+            )
 
         # If fixed_residual_width is enabled, replace normalization layers and wrap attention/MLP
         if self.fixed_residual_width:
@@ -133,12 +187,28 @@ class WidthVaryingBlock(Block):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        past_key_values: GenerationCache | None = None,
+        cache_params: GenerationCache | None = None,
         attention_mask: torch.Tensor | None = None,
         rope_cos_sin: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None = None,
+        attention_group_plan: AttentionGroupDispatchPlan | None = None,
     ) -> torch.Tensor:
+        """Run one block, using compact grouped attention when configured.
+
+        Args:
+            hidden_states (torch.Tensor): Input states, shape ``[batch, seq, width]``.
+            cache_params (GenerationCache | None): Autoregressive cache for dense layers.
+            attention_mask (torch.Tensor | None): Dense attention mask.
+            rope_cos_sin (torch.Tensor | None): Reserved parent-model RoPE input.
+            cu_seqlens (torch.Tensor | None): Packed sequence offsets.
+            max_seqlen (int | None): Maximum packed sequence length.
+            attention_group_plan (AttentionGroupDispatchPlan | None): Shared routing layout.
+
+        Returns:
+            torch.Tensor: Output states, shape ``[batch, seq, width]``.
+        """
+
         assert rope_cos_sin is None
 
         past_length = None
@@ -147,7 +217,7 @@ class WidthVaryingBlock(Block):
         if self.use_padding_free_transformer:
             key_length = max_seqlen.item() if isinstance(max_seqlen, torch.Tensor) else max_seqlen
         else:
-            past_length = 0 if past_key_values is None else past_key_values.get_seq_length()
+            past_length = 0 if cache_params is None else cache_params.get_seq_length()
             query_length = hidden_states.shape[1]
             key_length = past_length + query_length
         position_ids = self._get_position_ids(
@@ -155,23 +225,48 @@ class WidthVaryingBlock(Block):
         )
         rope_cos_sin = self._get_rope_cos_sin(key_length, position_ids, dtype=hidden_states.dtype)
 
-        return super().forward(
+        if not self.uses_attention_groups:
+            return super().forward(
+                hidden_states,
+                cache_params=cache_params,
+                attention_mask=attention_mask,
+                rope_cos_sin=rope_cos_sin,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+
+        if cache_params is not None or cu_seqlens is not None:
+            raise ValueError("attention grouping is a fixed-length pretraining path")
+        if attention_group_plan is None:
+            raise ValueError("grouped blocks require the shared attention-group plan")
+
+        residual = hidden_states
+        hidden_states = self.ln_1(hidden_states)
+        hidden_states = self.sequence_mixer(
             hidden_states,
-            past_key_values=past_key_values,
-            attention_mask=attention_mask,
             rope_cos_sin=rope_cos_sin,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
+            dispatch_plan=attention_group_plan,
         )
+        if self.m_residual is not None:
+            hidden_states = hidden_states * self.m_residual
+        hidden_states = hidden_states + residual
+        residual = hidden_states
+        hidden_states = self.ln_2(hidden_states)
+        hidden_states = self.mlp_block(hidden_states)
+        if self.m_residual is not None:
+            hidden_states = hidden_states * self.m_residual
+        return hidden_states + residual
 
     # -- helper functions copied from BaseModelMixin -- #
 
     def _get_rope_cos_sin(
         self, key_length: int, position_ids: torch.Tensor, dtype: torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cos, sin = self.rope(key_length, dtype=dtype)
-        cos = cos[position_ids].unsqueeze(1)
-        sin = sin[position_ids].unsqueeze(1)
+        cos, sin = self.rope(key_length)
+        cos = cos.to(dtype=dtype)
+        sin = sin.to(dtype=dtype)
+        cos = cos[position_ids]
+        sin = sin[position_ids]
         return cos, sin
 
     def _get_position_ids(
@@ -467,7 +562,29 @@ class WidthVaryingModel(GPTBaseModel):
     _no_split_modules = ["WidthVaryingBlock"]
 
     def _init_model(self, config: WidthVaryingConfig, **kwargs) -> None:
+        """Initialize embeddings, resize operators, and the shared router.
+
+        Args:
+            config (WidthVaryingConfig): Model configuration.
+            **kwargs: Parent model initialization arguments.
+        """
+
         super()._init_model(config, **kwargs)
+
+        self.attention_group_router: AttentionGroupRouter | None = None
+        self._attention_group_metrics: dict[str, torch.Tensor] = {}
+        if config.attention_group_num_layers > 0:
+            grouped_blocks = list(self.h.values())[: config.attention_group_num_layers]
+            if len(grouped_blocks) != config.attention_group_num_layers:
+                raise ValueError("all grouped layers must reside on the current pipeline stage")
+            router_std = grouped_blocks[0].attention_group_router_std
+            self.attention_group_router = AttentionGroupRouter(
+                input_width=config.widths[0],
+                num_groups=config.attention_num_groups,
+                top_k=config.attention_num_groups_per_token,
+                capacity_multiple=config.attention_group_capacity_multiple,
+                std=router_std,
+            )
 
         # Handle embedding_width: recreate wte with embedding_width instead of hidden_size
         if self.embed_dim != config.embedding_width:
@@ -615,7 +732,7 @@ class WidthVaryingModel(GPTBaseModel):
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
-        past_key_values: GenerationCache | None = None,
+        cache_params: GenerationCache | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         use_cache: bool | None = None,
@@ -628,10 +745,10 @@ class WidthVaryingModel(GPTBaseModel):
             causal_mask,
             position_ids,
             rope_cos_sin,
-            past_key_values,
+            cache_params,
         ) = self._prepare_a_bunch_of_stuff(
             input_ids=input_ids,
-            past_key_values=past_key_values,
+            cache_params=cache_params,
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=use_cache,
@@ -643,22 +760,28 @@ class WidthVaryingModel(GPTBaseModel):
         layer_hidden_states = [hidden_states]
 
         if is_generation_cache_enabled():
-            past_key_values = (
-                GenerationCache(self.config)
-                if use_cache and past_key_values is None
-                else past_key_values
+            cache_params = (
+                GenerationCache()
+                if use_cache and cache_params is None
+                else cache_params
             )
+
+        if self.attention_group_router is not None and (
+            cache_params is not None or cu_seqlens is not None
+        ):
+            raise ValueError("attention grouping currently supports fixed-length pretraining only")
 
         mamba_mask = None
         mamba_mask_computed = False
+        attention_group_plan: AttentionGroupDispatchPlan | None = None
 
         for layer_idx, (sequence_mixer_type, block) in enumerate(
-            zip(self.sequence_mixer_block_types, self.h)
+            zip(self.sequence_mixer_block_types, self.h.values())
         ):
             is_linear_layer = sequence_mixer_type in ["mamba2", "rnn", "gru"]
 
             if is_linear_layer and not mamba_mask_computed:
-                mamba_mask = self._get_mamba_mask(attention_mask, past_key_values)
+                mamba_mask = self._get_mamba_mask(attention_mask, cache_params)
                 mamba_mask_computed = True
 
             # Skip resizing if fixed_residual_width is enabled (reshaping happens in block's linear layers)
@@ -694,13 +817,25 @@ class WidthVaryingModel(GPTBaseModel):
                     self.config.sinkhorn_iters,
                 )
 
+            if layer_idx == 0 and self.attention_group_router is not None:
+                attention_group_plan = self.attention_group_router(hidden_states)
+                self._attention_group_metrics = {
+                    "assignment_shares": attention_group_plan.assignment_shares,
+                    "entropy": attention_group_plan.entropy,
+                    "balance": attention_group_plan.balance,
+                    "max_capacity_ratio": attention_group_plan.max_capacity_ratio,
+                }
+
             hidden_states = block(
                 hidden_states,
-                past_key_values=past_key_values,
+                cache_params=cache_params,
                 attention_mask=mamba_mask if is_linear_layer else causal_mask,
                 rope_cos_sin=rope_cos_sin,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                attention_group_plan=(
+                    attention_group_plan if block.uses_attention_groups else None
+                ),
             )
             layer_hidden_states.append(hidden_states)
 
@@ -742,15 +877,28 @@ class WidthVaryingModel(GPTBaseModel):
             )
 
         return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states, past_key_values=past_key_values
+            last_hidden_state=hidden_states, cache_params=cache_params
         )
+
+    def get_attention_group_metrics(self) -> dict[str, torch.Tensor]:
+        """Return detached diagnostics from the most recent routing decision.
+
+        Returns:
+            dict[str, torch.Tensor]: Assignment shares, entropy, balance, and
+            maximum capacity inflation. The dictionary is empty for dense models.
+        """
+
+        return self._attention_group_metrics.copy()
 
     def _setup_positional_encoding(self) -> None:
         pass
 
     def _get_rope_cos_sin(
-        self, key_length: int, position_ids: torch.Tensor, dtype: torch.dtype
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        key_length: int,
+        position_ids: torch.Tensor,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         pass
 
 
@@ -776,7 +924,7 @@ class WidthVaryingModelForCausalLM(GPTBaseForCausalLM):
         self._widths_logged = False
 
     def forward(self, *args, **kwargs):
-        if not self._widths_logged:
+        if not self._widths_logged and not torch.compiler.is_compiling():
             log_rank_0(logging.INFO, f"WidthVaryingModel widths per layer: {self.config.widths}")
             self._widths_logged = True
         return super().forward(*args, **kwargs)

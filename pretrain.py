@@ -8,8 +8,8 @@ import os
 import sys
 
 import yaml
-from lm_engine.lm_engine.pretrain import main as dolomite_main
-from lm_engine.lm_engine.utils.yaml import load_yaml
+from lm_engine.pretrain import main as dolomite_main
+from lm_engine.utils.yaml import load_yaml
 
 from custom_yaml_utils import update_custom_yaml
 

@@ -1,7 +1,7 @@
 import datetime
 import os
 
-from lm_engine.lm_engine.utils.yaml import load_yaml
+from lm_engine.utils.yaml import load_yaml
 
 
 def update_custom_yaml(input_path: str) -> str:

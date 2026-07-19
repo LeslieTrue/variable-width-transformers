@@ -1,8 +1,10 @@
 import logging
 import random
 
-from lm_engine.lm_engine.hf_models.config import CommonConfig
-from lm_engine.lm_engine.utils import log_rank_0
+from lm_engine.hf_models.config import CommonConfig
+from lm_engine.utils import log_rank_0
+
+from attention_grouping import resolve_attention_group_head_schedule
 
 from scripts.solve_hparams import (
     compute_base_width,
@@ -130,6 +132,12 @@ class WidthVaryingConfig(CommonConfig):
         sinkhorn_iters: int = 0,
         expand_linear_bias: bool = False,
         variable_initialization: bool = True,
+        attention_num_groups: int = 1,
+        attention_num_groups_per_token: int = 1,
+        attention_group_num_layers: int = 0,
+        attention_group_compute_match: bool = False,
+        attention_group_capacity_multiple: int = 128,
+        attention_group_heads_per_layer: list[int] | None = None,
         **kwargs,
     ) -> None:
         # Automatically determine schedule type based on which parameters are provided
@@ -183,6 +191,12 @@ class WidthVaryingConfig(CommonConfig):
         self.sinkhorn_iters = sinkhorn_iters
         self.expand_linear_bias = expand_linear_bias
         self.variable_initialization = variable_initialization
+        self.attention_num_groups = attention_num_groups
+        self.attention_num_groups_per_token = attention_num_groups_per_token
+        self.attention_group_num_layers = attention_group_num_layers
+        self.attention_group_compute_match = attention_group_compute_match
+        self.attention_group_capacity_multiple = attention_group_capacity_multiple
+        self.attention_group_heads_per_layer = attention_group_heads_per_layer
         if sinkhorn_iters > 0:
             assert expand_method in ["linear", "linear_diff"], (
                 f"sinkhorn_iters > 0 only supported with linear/linear_diff, got {expand_method}"
@@ -401,6 +415,55 @@ class WidthVaryingConfig(CommonConfig):
                 self.widths = target_widths
             else:
                 self.widths = [self.widths[0]] + target_widths + [self.widths[-1]]
+
+        grouping_enabled = self.attention_num_groups > 1
+        if grouping_enabled:
+            if not 1 <= self.attention_num_groups_per_token <= self.attention_num_groups:
+                raise ValueError(
+                    "attention_num_groups_per_token must be in [1, attention_num_groups]"
+                )
+            if not 1 <= self.attention_group_num_layers <= self.num_layers:
+                raise ValueError(
+                    "attention_group_num_layers must be in [1, num_layers] when grouping is enabled"
+                )
+            if self.fixed_residual_width:
+                raise ValueError("attention grouping does not support fixed_residual_width")
+            if self.attention_group_capacity_multiple <= 0:
+                raise ValueError("attention_group_capacity_multiple must be positive")
+
+            dense_heads = [
+                block.num_attention_heads
+                for block in self.sequence_mixer_blocks[: self.attention_group_num_layers]
+            ]
+            if self.attention_group_heads_per_layer is None:
+                self.attention_group_heads_per_layer = resolve_attention_group_head_schedule(
+                    widths=self.widths[: self.attention_group_num_layers],
+                    dense_heads=dense_heads,
+                    sequence_length=self.max_position_embeddings,
+                    num_groups=self.attention_num_groups,
+                    top_k=self.attention_num_groups_per_token,
+                    compute_match=self.attention_group_compute_match,
+                )
+            elif len(self.attention_group_heads_per_layer) != self.attention_group_num_layers:
+                raise ValueError(
+                    "attention_group_heads_per_layer must have attention_group_num_layers entries"
+                )
+            if any(heads <= 0 for heads in self.attention_group_heads_per_layer):
+                raise ValueError("attention group head counts must be positive")
+            log_rank_0(
+                logging.INFO,
+                "Attention grouping: "
+                f"layers={self.attention_group_num_layers}, "
+                f"groups={self.attention_num_groups}, "
+                f"top_k={self.attention_num_groups_per_token}, "
+                f"heads={self.attention_group_heads_per_layer}",
+            )
+        else:
+            if self.attention_group_num_layers != 0:
+                raise ValueError(
+                    "attention_group_num_layers must be 0 when attention_num_groups == 1"
+                )
+            self.attention_group_heads_per_layer = []
 
         if self.original_input_width:  # fixed_residual_width entails this
             self.embedding_width = self.hidden_size

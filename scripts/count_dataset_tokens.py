@@ -15,7 +15,7 @@ sys.path.insert(0, root_dir)
 
 from argparse import ArgumentParser
 
-from lm_engine.lm_engine.data.megatron.indexed_dataset import MMapIndexedDataset
+from lm_engine.data.megatron.indexed_dataset import MMapIndexedDataset
 
 
 def main() -> None:

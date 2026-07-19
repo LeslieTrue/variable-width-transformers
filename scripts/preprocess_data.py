@@ -16,7 +16,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from lm_engine.lm_engine.data.megatron.indexed_dataset import DType, MMapIndexedDatasetBuilder
+from lm_engine.data.megatron.indexed_dataset import DType, MMapIndexedDatasetBuilder
 
 
 class Encoder:
