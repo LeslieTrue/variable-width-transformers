@@ -10,6 +10,7 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -456,6 +457,144 @@ class AttentionGroupRouter(nn.Module):
             balance=balance.detach(),
             max_capacity_ratio=max_capacity_ratio.detach(),
         )
+
+
+class AttentionGroupMoE(nn.Module):
+    """CORTEX-style shared-plus-column-private expert MLP.
+
+    The two-way expert router is evaluated after attention. Its first gate
+    weights one expert shared by every attention column; its second gate
+    weights one private expert in each column. Shared output is evaluated once
+    per token, while private output is evaluated once per active column and
+    mixed with the block-level attention-group gates.
+
+    Attributes:
+        hidden_size (int): Input and output token width.
+        num_private_experts (int): Number of column-private expert banks.
+        shared_expert (nn.Module): SwiGLU expert applied to every token.
+        private_experts (nn.ModuleList): One SwiGLU expert per column.
+        expert_gate (ParameterizedLinear): Two-choice shared/private router.
+    """
+
+    hidden_size: int
+    num_private_experts: int
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        num_private_experts: int,
+        shared_expert: nn.Module,
+        private_expert_factory: Callable[[], nn.Module],
+        router_std: float,
+    ) -> None:
+        """Initialize the shared and private expert banks.
+
+        Args:
+            hidden_size (int): Input and output token width.
+            num_private_experts (int): Attention columns at this depth block.
+            shared_expert (nn.Module): Pre-built native VWT SwiGLU expert.
+            private_expert_factory (Callable[[], nn.Module]): Factory returning
+                an independently initialized ``[*, hidden] -> [*, hidden]``
+                native VWT SwiGLU expert.
+            router_std (float): Initialization standard deviation for the
+                two-logit expert gate.
+        """
+
+        super().__init__()
+        if hidden_size <= 0 or num_private_experts <= 0:
+            raise ValueError("expert width and private-expert count must be positive")
+        self.hidden_size = hidden_size
+        self.num_private_experts = num_private_experts
+        self.shared_expert = shared_expert
+        self.private_experts = nn.ModuleList(
+            [private_expert_factory() for _ in range(num_private_experts)]
+        )
+        self.expert_gate = ParameterizedLinear(
+            hidden_size, 2, bias=False, std=router_std
+        )
+        mark_parameter_as_mup_learning_rate(self.expert_gate.weight)
+
+    @torch.compiler.disable
+    def _private_update(
+        self,
+        x: torch.Tensor,
+        private_gate: torch.Tensor,
+        dispatch_plan: AttentionGroupDispatchPlan,
+    ) -> torch.Tensor:
+        """Dispatch tokens to their column-private experts.
+
+        Args:
+            x (torch.Tensor): Normalized tokens, shape ``[batch, seq, hidden]``.
+            private_gate (torch.Tensor): Private expert mixture coefficient,
+                shape ``[batch, seq]``.
+            dispatch_plan (AttentionGroupDispatchPlan): Block-level attention
+                column memberships and normalized group gates.
+
+        Returns:
+            torch.Tensor: Gate-weighted private update, shape
+            ``[batch, seq, hidden]``.
+        """
+
+        if len(dispatch_plan.entries) != self.num_private_experts:
+            raise ValueError("dispatch plan does not match private expert count")
+        batch_size, sequence_length, _ = x.shape
+        output = x.new_zeros(batch_size, sequence_length, self.hidden_size)
+        for expert, entry in zip(self.private_experts, dispatch_plan.entries):
+            capacity = entry.gather_indices.shape[1]
+            if capacity == 0:
+                output = output + 0.0 * expert(x[:, :1]).sum()
+                continue
+            gather_index = entry.gather_indices.unsqueeze(-1).expand(
+                -1, -1, self.hidden_size
+            )
+            compact_x = torch.gather(x, dim=1, index=gather_index)
+            compact_private_gate = torch.gather(
+                private_gate, dim=1, index=entry.gather_indices
+            )
+            compact_output = expert(compact_x)
+            compact_weight = entry.gates * compact_private_gate
+            compact_output = torch.where(
+                entry.valid_mask.unsqueeze(-1), compact_output, 0.0
+            )
+            compact_output = compact_output * compact_weight.unsqueeze(-1)
+            output.scatter_add_(dim=1, index=gather_index, src=compact_output)
+        return output
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        dispatch_plan: AttentionGroupDispatchPlan | None = None,
+    ) -> torch.Tensor:
+        """Apply the shared expert and the selected private expert columns.
+
+        Args:
+            x (torch.Tensor): Normalized tokens, shape ``[batch, seq, hidden]``.
+            dispatch_plan (AttentionGroupDispatchPlan | None): Group routing
+                plan for a multi-column block. Must be absent when this module
+                represents a one-column dense block.
+
+        Returns:
+            torch.Tensor: Routed MLP update, shape ``[batch, seq, hidden]``.
+        """
+
+        if x.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"expert MLP expected width {self.hidden_size}, got {x.shape[-1]}"
+            )
+        expert_gates = F.softmax(self.expert_gate(x).float(), dim=-1).type_as(x)
+        shared_update = self.shared_expert(x) * expert_gates[..., :1]
+        if self.num_private_experts == 1:
+            if dispatch_plan is not None:
+                raise ValueError("single-column MLP does not accept a dispatch plan")
+            private_update = self.private_experts[0](x) * expert_gates[..., 1:]
+        else:
+            if dispatch_plan is None:
+                raise ValueError("multi-column MLP requires the attention dispatch plan")
+            private_update = self._private_update(
+                x, expert_gates[..., 1], dispatch_plan
+            )
+        return shared_update + private_update
 
 
 class _AttentionGroupProjection(nn.Module):

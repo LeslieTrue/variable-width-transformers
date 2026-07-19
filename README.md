@@ -117,3 +117,20 @@ bash pretrain.sh configs/moe_1b3b.yml
 - `symmetric_widths`: derive the missing side of the schedule so first and last widths match.
 - `quantize_to`: round scheduled widths to an implementation-friendly multiple.
 - `expand_method`: resize method between variable-width residual streams.
+
+## Attention Groups and Shared/Private Experts
+
+The optional attention-group path uses one top-k router at the entrance of an
+early layer span and reuses its no-drop compact causal dispatch in every layer
+of that span. Set `attention_num_groups`,
+`attention_num_groups_per_token`, `attention_group_num_layers`, and
+`attention_group_heads_per_layer` to configure its routing and per-group
+capacity.
+
+Set `attention_group_moe: true` to pair this with the CORTEX expert layout.
+Every layer then owns one shared SwiGLU expert plus one private expert per
+attention column; single-column later layers own one of each. The learned
+two-choice expert router mixes the shared output (evaluated once per token)
+with the group-gated private outputs. `attention_group_moe_expansion_ratio`
+sets each expert's hidden-width ratio and defaults to `2.0`, so two expert
+evaluations in a single-column layer match one dense 4x SwiGLU.

@@ -138,6 +138,8 @@ class WidthVaryingConfig(CommonConfig):
         attention_group_compute_match: bool = False,
         attention_group_capacity_multiple: int = 128,
         attention_group_heads_per_layer: list[int] | None = None,
+        attention_group_moe: bool = False,
+        attention_group_moe_expansion_ratio: float = 2.0,
         **kwargs,
     ) -> None:
         # Automatically determine schedule type based on which parameters are provided
@@ -197,6 +199,8 @@ class WidthVaryingConfig(CommonConfig):
         self.attention_group_compute_match = attention_group_compute_match
         self.attention_group_capacity_multiple = attention_group_capacity_multiple
         self.attention_group_heads_per_layer = attention_group_heads_per_layer
+        self.attention_group_moe = attention_group_moe
+        self.attention_group_moe_expansion_ratio = attention_group_moe_expansion_ratio
         if sinkhorn_iters > 0:
             assert expand_method in ["linear", "linear_diff"], (
                 f"sinkhorn_iters > 0 only supported with linear/linear_diff, got {expand_method}"
@@ -465,6 +469,25 @@ class WidthVaryingConfig(CommonConfig):
                 )
             self.attention_group_heads_per_layer = []
 
+        if self.attention_group_moe:
+            if not grouping_enabled:
+                raise ValueError("attention_group_moe requires attention grouping")
+            if self.num_layers < 3:
+                raise ValueError("the three-block attention-group MoE needs at least 3 layers")
+            if self.attention_group_moe_expansion_ratio <= 0:
+                raise ValueError("attention_group_moe_expansion_ratio must be positive")
+            for mlp_block in self.mlp_blocks:
+                if getattr(mlp_block, "mlp_type", None) != "MLP":
+                    raise ValueError("attention_group_moe requires native dense MLP blocks")
+                if getattr(mlp_block, "activation_function", None) != "swiglu":
+                    raise ValueError("attention_group_moe currently requires SwiGLU experts")
+            log_rank_0(
+                logging.INFO,
+                "Attention-group MoE: three depth blocks, one shared and one "
+                "column-private expert, "
+                f"expert expansion={self.attention_group_moe_expansion_ratio:g}",
+            )
+
         if self.original_input_width:  # fixed_residual_width entails this
             self.embedding_width = self.hidden_size
         else:
@@ -504,5 +527,9 @@ class WidthVaryingConfig(CommonConfig):
                     None,
                 ), "moe_shared_intermediate_size must be -1 (no shared expert)"
                 mlp_block.shared_intermediate_size = None
+            elif self.attention_group_moe:
+                mlp_block.intermediate_size = int(
+                    round(width * self.attention_group_moe_expansion_ratio)
+                )
             else:
                 mlp_block.intermediate_size = width * 4

@@ -22,12 +22,14 @@ from lm_engine.hf_models.modeling_utils.linear import ParameterizedLinear
 from lm_engine.hf_models.modeling_utils.normalization import get_normalization_function
 from lm_engine.hf_models.modeling_utils.position_embedding.rope import RoPE
 from lm_engine.hf_models.modeling_utils import ParameterizedEmbedding
+from lm_engine.hf_models.modeling_utils.mlp_blocks import get_mlp_block
 from lm_engine.hf_models.utils import is_generation_cache_enabled
 from lm_engine.hf_models.parameter import mark_parameter_as_mup_learning_rate
 from lm_engine.utils import log_rank_0
 
 from attention_grouping import (
     AttentionGroupDispatchPlan,
+    AttentionGroupMoE,
     AttentionGroupRouter,
     GroupedSelfAttention,
 )
@@ -70,6 +72,7 @@ class WidthVaryingBlock(Block):
             config.initializer_range = orig_initializer_range * math.sqrt(
                 orig_hidden_size / config.hidden_size
             )
+        layer_initializer_range = config.initializer_range
 
         super().__init__(
             config,
@@ -119,6 +122,35 @@ class WidthVaryingBlock(Block):
                 dropout=dense_attention.dropout.p,
                 qkv_std=float(dense_attention.c_attn.std),
                 out_std=float(dense_attention.c_proj.std),
+            )
+
+        if config.attention_group_moe:
+            shared_expert = self.mlp_block
+
+            def make_private_expert() -> nn.Module:
+                """Build one independently initialized native VWT expert."""
+
+                config.hidden_size = self.hidden_size
+                config.initializer_range = layer_initializer_range
+                try:
+                    return get_mlp_block(
+                        config,
+                        use_padding_free_transformer,
+                        sequence_parallel,
+                        layer_idx,
+                    )
+                finally:
+                    config.hidden_size = orig_hidden_size
+                    config.initializer_range = orig_initializer_range
+
+            self.mlp_block = AttentionGroupMoE(
+                hidden_size=self.hidden_size,
+                num_private_experts=(
+                    config.attention_num_groups if self.uses_attention_groups else 1
+                ),
+                shared_expert=shared_expert,
+                private_expert_factory=make_private_expert,
+                router_std=float(shared_expert.c_fc.std),
             )
 
         # If fixed_residual_width is enabled, replace normalization layers and wrap attention/MLP
@@ -252,7 +284,10 @@ class WidthVaryingBlock(Block):
         hidden_states = hidden_states + residual
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
-        hidden_states = self.mlp_block(hidden_states)
+        if isinstance(self.mlp_block, AttentionGroupMoE):
+            hidden_states = self.mlp_block(hidden_states, attention_group_plan)
+        else:
+            hidden_states = self.mlp_block(hidden_states)
         if self.m_residual is not None:
             hidden_states = hidden_states * self.m_residual
         return hidden_states + residual

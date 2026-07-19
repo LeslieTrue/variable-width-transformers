@@ -9,6 +9,7 @@ import torch
 import yaml
 
 from attention_grouping import (
+    AttentionGroupMoE,
     AttentionGroupRouter,
     GroupedSelfAttention,
     attention_group_flop_ratio,
@@ -187,6 +188,68 @@ class TestGroupedSelfAttentionTest:
             assert group.out_proj.weight.grad is not None
 
 
+class TestAttentionGroupMoETest:
+    """Reference tests for the shared-plus-column-private expert MLP."""
+
+    def test_sparse_private_dispatch_matches_dense_reference(self) -> None:
+        """Shared-once and per-column private updates should match a slow sum."""
+
+        torch.manual_seed(11)
+        router = AttentionGroupRouter(
+            input_width=4,
+            num_groups=2,
+            top_k=2,
+            capacity_multiple=1,
+            std=0.1,
+        ).eval()
+        shared = torch.nn.Linear(4, 4, bias=False)
+        module = AttentionGroupMoE(
+            hidden_size=4,
+            num_private_experts=2,
+            shared_expert=shared,
+            private_expert_factory=lambda: torch.nn.Linear(4, 4, bias=False),
+            router_std=0.1,
+        ).eval()
+        x = torch.randn(2, 3, 4, requires_grad=True)
+        plan = router(x)
+        actual = module(x, plan)
+
+        expert_gates = torch.softmax(module.expert_gate(x).float(), dim=-1).type_as(x)
+        reference = module.shared_expert(x) * expert_gates[..., :1]
+        for expert, entry in zip(module.private_experts, plan.entries):
+            for batch_index in range(x.shape[0]):
+                valid = entry.valid_mask[batch_index]
+                indices = entry.gather_indices[batch_index, valid]
+                weights = entry.gates[batch_index, valid]
+                weights = weights * expert_gates[batch_index, indices, 1]
+                reference[batch_index, indices] += (
+                    expert(x[batch_index, indices]) * weights.unsqueeze(-1)
+                )
+        torch.testing.assert_close(actual, reference)
+
+        actual.square().sum().backward()
+        assert module.shared_expert.weight.grad is not None
+        assert module.expert_gate.weight.grad is not None
+        for expert in module.private_experts:
+            assert expert.weight.grad is not None
+
+    def test_single_column_runs_shared_and_private_once(self) -> None:
+        """Dense later blocks should need no attention dispatch plan."""
+
+        module = AttentionGroupMoE(
+            hidden_size=3,
+            num_private_experts=1,
+            shared_expert=torch.nn.Linear(3, 3, bias=False),
+            private_expert_factory=lambda: torch.nn.Linear(3, 3, bias=False),
+            router_std=0.1,
+        )
+        x = torch.randn(2, 5, 3)
+        gates = torch.softmax(module.expert_gate(x).float(), dim=-1).type_as(x)
+        expected = module.shared_expert(x) * gates[..., :1]
+        expected += module.private_experts[0](x) * gates[..., 1:]
+        torch.testing.assert_close(module(x), expected)
+
+
 class TestWidthVaryingAttentionGroupIntegrationTest:
     """End-to-end tests for shared routing through the VWT model."""
 
@@ -245,3 +308,61 @@ class TestWidthVaryingAttentionGroupIntegrationTest:
 
         output.last_hidden_state.square().mean().backward()
         assert model.attention_group_router.gate.weight.grad is not None
+
+    def test_model_builds_three_block_shared_private_experts(self) -> None:
+        """Grouped block 0 and dense blocks 1-2 should use 2x experts."""
+
+        template_path = Path(__file__).parents[1] / "configs" / "dense_200m.yml"
+        with template_path.open(encoding="utf-8") as file:
+            model_args = yaml.safe_load(file)["model_args"]["pretrained_config"]
+        model_args.update(
+            hidden_size=64,
+            base_width=64,
+            bottleneck_ratio=1.0,
+            expansion_factor=1.0,
+            reduction_factor=1.0,
+            max_layer=2,
+            num_layers=3,
+            quantize_to=16,
+            max_position_embeddings=8,
+            vocab_size=128,
+            bos_token_id=1,
+            eos_token_id=1,
+            pad_token_id=0,
+            m_width=1,
+            m_emb=1,
+            layer_norm_epsilon=1e-5,
+            attention_num_groups=4,
+            attention_num_groups_per_token=2,
+            attention_group_num_layers=1,
+            attention_group_compute_match=True,
+            attention_group_capacity_multiple=2,
+            attention_group_moe=True,
+            attention_group_moe_expansion_ratio=2.0,
+        )
+        model_args.pop("attention_group_heads_per_layer", None)
+        attention = copy.deepcopy(model_args["sequence_mixer_blocks"][0])
+        attention["num_attention_heads"] = 4
+        attention["num_key_value_heads"] = 4
+        attention["attention_multiplier_method"] = None
+        model_args["sequence_mixer_blocks"] = [
+            copy.deepcopy(attention) for _ in range(3)
+        ]
+        mlp = copy.deepcopy(model_args["mlp_blocks"][0])
+        model_args["mlp_blocks"] = [copy.deepcopy(mlp) for _ in range(3)]
+
+        config = WidthVaryingConfig(**model_args)
+        model = WidthVaryingModel(config)
+        blocks = list(model.h.values())
+        assert all(isinstance(block.mlp_block, AttentionGroupMoE) for block in blocks)
+        assert [block.mlp_block.num_private_experts for block in blocks] == [4, 1, 1]
+        assert [block.mlp_block.shared_expert.c_proj.in_features for block in blocks] == [
+            128,
+            128,
+            128,
+        ]
+
+        clear_aux_loss()
+        output = model(input_ids=torch.randint(0, 128, (2, 8)), use_cache=False)
+        output.last_hidden_state.square().mean().backward()
+        assert all(block.mlp_block.expert_gate.weight.grad is not None for block in blocks)
