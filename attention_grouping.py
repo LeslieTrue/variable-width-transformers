@@ -1,8 +1,9 @@
 """Shared-router token-dispatch attention for variable-width transformers.
 
-The grouped span routes every token once at its entrance, reuses that routing
-decision across its layers, and restricts causal attention to tokens assigned
-to the same group.  Group outputs are mixed with normalized top-k gates.
+Each grouped depth block routes every token once at its entrance, reuses that
+routing decision across its layers, and restricts causal attention to tokens
+assigned to the same group. Group outputs are mixed with normalized top-k
+gates.
 """
 
 from __future__ import annotations

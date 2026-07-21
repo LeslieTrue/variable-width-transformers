@@ -94,16 +94,16 @@ class WidthVaryingBlock(Block):
             self.rope_dim, max_position_embeddings=max_position_embeddings, base=config.rope_theta
         )
         self.use_padding_free_transformer = use_padding_free_transformer
-        self.attention_group_block_index = (
+        self.attention_group_block_index: int = (
             config.attention_group_block_index_per_layer[layer_idx]
         )
-        self.attention_group_num_groups = config.attention_num_groups_per_layer[
-            layer_idx
-        ]
-        self.attention_group_top_k = (
+        self.attention_group_num_groups: int = (
+            config.attention_num_groups_per_layer[layer_idx]
+        )
+        self.attention_group_top_k: int = (
             config.attention_num_groups_per_token_per_layer[layer_idx]
         )
-        self.uses_attention_groups = self.attention_group_num_groups > 1
+        self.uses_attention_groups: bool = self.attention_group_num_groups > 1
 
         if self.uses_attention_groups:
             if use_padding_free_transformer or sequence_parallel:
@@ -615,7 +615,7 @@ class WidthVaryingModel(GPTBaseModel):
     _no_split_modules = ["WidthVaryingBlock"]
 
     def _init_model(self, config: WidthVaryingConfig, **kwargs) -> None:
-        """Initialize embeddings, resize operators, and the shared router.
+        """Initialize embeddings, resize operators, and depth-block routers.
 
         Args:
             config (WidthVaryingConfig): Model configuration.
@@ -624,7 +624,7 @@ class WidthVaryingModel(GPTBaseModel):
 
         super()._init_model(config, **kwargs)
 
-        self.attention_group_routers = nn.ModuleDict()
+        self.attention_group_routers: nn.ModuleDict = nn.ModuleDict()
         self._attention_group_metrics: dict[str, torch.Tensor] = {}
         model_blocks = list(self.h.values())
         for layer_index in config.attention_group_router_layers:
