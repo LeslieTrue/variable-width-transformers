@@ -131,6 +131,11 @@ Set `attention_group_moe: true` to pair this with the CORTEX expert layout.
 Every layer then owns one shared SwiGLU expert plus one private expert per
 attention column; single-column later layers own one of each. The learned
 two-choice expert router mixes the shared output (evaluated once per token)
-with the group-gated private outputs. `attention_group_moe_expansion_ratio`
-sets each expert's hidden-width ratio and defaults to `2.0`, so two expert
-evaluations in a single-column layer match one dense 4x SwiGLU.
+with the group-gated private outputs. The SP-50 defaults assign a `2d` hidden
+width to the shared expert and a `2d` aggregate budget to active private
+experts. Consequently, each private expert uses `2d / top_k` in the grouped
+span and `2d` in single-column layers. The active shared-plus-private MLP cost
+therefore matches one dense `4d` SwiGLU at every depth. Configure the two
+budgets with `attention_group_moe_shared_expansion_ratio` and
+`attention_group_moe_private_active_expansion_ratio`; intermediate widths are
+aligned by `attention_group_moe_intermediate_multiple`.

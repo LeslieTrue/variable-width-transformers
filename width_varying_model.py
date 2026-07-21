@@ -126,12 +126,22 @@ class WidthVaryingBlock(Block):
 
         if config.attention_group_moe:
             shared_expert = self.mlp_block
+            mlp_config = config.mlp_blocks[layer_idx]
+            private_intermediate_size = (
+                config.attention_group_moe_private_intermediate_sizes[layer_idx]
+            )
 
             def make_private_expert() -> nn.Module:
-                """Build one independently initialized native VWT expert."""
+                """Build one independently initialized private VWT expert.
+
+                Returns:
+                    nn.Module: SwiGLU expert with the layer's SP-50 private width.
+                """
 
                 config.hidden_size = self.hidden_size
                 config.initializer_range = layer_initializer_range
+                original_intermediate_size = mlp_config.intermediate_size
+                mlp_config.intermediate_size = private_intermediate_size
                 try:
                     return get_mlp_block(
                         config,
@@ -140,6 +150,7 @@ class WidthVaryingBlock(Block):
                         layer_idx,
                     )
                 finally:
+                    mlp_config.intermediate_size = original_intermediate_size
                     config.hidden_size = orig_hidden_size
                     config.initializer_range = orig_initializer_range
 

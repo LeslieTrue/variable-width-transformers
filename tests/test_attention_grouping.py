@@ -309,8 +309,8 @@ class TestWidthVaryingAttentionGroupIntegrationTest:
         output.last_hidden_state.square().mean().backward()
         assert model.attention_group_router.gate.weight.grad is not None
 
-    def test_model_builds_three_block_shared_private_experts(self) -> None:
-        """Grouped block 0 and dense blocks 1-2 should use 2x experts."""
+    def test_model_builds_three_block_sp50_experts(self) -> None:
+        """SP-50 should split dense MLP compute equally across both paths."""
 
         template_path = Path(__file__).parents[1] / "configs" / "dense_200m.yml"
         with template_path.open(encoding="utf-8") as file:
@@ -338,7 +338,9 @@ class TestWidthVaryingAttentionGroupIntegrationTest:
             attention_group_compute_match=True,
             attention_group_capacity_multiple=2,
             attention_group_moe=True,
-            attention_group_moe_expansion_ratio=2.0,
+            attention_group_moe_shared_expansion_ratio=2.0,
+            attention_group_moe_private_active_expansion_ratio=2.0,
+            attention_group_moe_intermediate_multiple=8,
         )
         model_args.pop("attention_group_heads_per_layer", None)
         attention = copy.deepcopy(model_args["sequence_mixer_blocks"][0])
@@ -361,6 +363,11 @@ class TestWidthVaryingAttentionGroupIntegrationTest:
             128,
             128,
         ]
+        assert [
+            block.mlp_block.private_experts[0].c_proj.in_features for block in blocks
+        ] == [64, 128, 128]
+        assert config.attention_group_moe_shared_intermediate_sizes == [128] * 3
+        assert config.attention_group_moe_private_intermediate_sizes == [64, 128, 128]
 
         clear_aux_loss()
         output = model(input_ids=torch.randint(0, 128, (2, 8)), use_cache=False)

@@ -139,7 +139,10 @@ class WidthVaryingConfig(CommonConfig):
         attention_group_capacity_multiple: int = 128,
         attention_group_heads_per_layer: list[int] | None = None,
         attention_group_moe: bool = False,
-        attention_group_moe_expansion_ratio: float = 2.0,
+        attention_group_moe_expansion_ratio: float | None = None,
+        attention_group_moe_shared_expansion_ratio: float = 2.0,
+        attention_group_moe_private_active_expansion_ratio: float = 2.0,
+        attention_group_moe_intermediate_multiple: int = 8,
         **kwargs,
     ) -> None:
         # Automatically determine schedule type based on which parameters are provided
@@ -200,7 +203,23 @@ class WidthVaryingConfig(CommonConfig):
         self.attention_group_capacity_multiple = attention_group_capacity_multiple
         self.attention_group_heads_per_layer = attention_group_heads_per_layer
         self.attention_group_moe = attention_group_moe
+        if attention_group_moe_expansion_ratio is not None:
+            attention_group_moe_shared_expansion_ratio = (
+                attention_group_moe_expansion_ratio
+            )
+            attention_group_moe_private_active_expansion_ratio = (
+                attention_group_moe_expansion_ratio
+            )
         self.attention_group_moe_expansion_ratio = attention_group_moe_expansion_ratio
+        self.attention_group_moe_shared_expansion_ratio = (
+            attention_group_moe_shared_expansion_ratio
+        )
+        self.attention_group_moe_private_active_expansion_ratio = (
+            attention_group_moe_private_active_expansion_ratio
+        )
+        self.attention_group_moe_intermediate_multiple = (
+            attention_group_moe_intermediate_multiple
+        )
         if sinkhorn_iters > 0:
             assert expand_method in ["linear", "linear_diff"], (
                 f"sinkhorn_iters > 0 only supported with linear/linear_diff, got {expand_method}"
@@ -474,8 +493,18 @@ class WidthVaryingConfig(CommonConfig):
                 raise ValueError("attention_group_moe requires attention grouping")
             if self.num_layers < 3:
                 raise ValueError("the three-block attention-group MoE needs at least 3 layers")
-            if self.attention_group_moe_expansion_ratio <= 0:
-                raise ValueError("attention_group_moe_expansion_ratio must be positive")
+            if self.attention_group_moe_shared_expansion_ratio <= 0:
+                raise ValueError(
+                    "attention_group_moe_shared_expansion_ratio must be positive"
+                )
+            if self.attention_group_moe_private_active_expansion_ratio <= 0:
+                raise ValueError(
+                    "attention_group_moe_private_active_expansion_ratio must be positive"
+                )
+            if self.attention_group_moe_intermediate_multiple <= 0:
+                raise ValueError(
+                    "attention_group_moe_intermediate_multiple must be positive"
+                )
             for mlp_block in self.mlp_blocks:
                 if getattr(mlp_block, "mlp_type", None) != "MLP":
                     raise ValueError("attention_group_moe requires native dense MLP blocks")
@@ -483,9 +512,11 @@ class WidthVaryingConfig(CommonConfig):
                     raise ValueError("attention_group_moe currently requires SwiGLU experts")
             log_rank_0(
                 logging.INFO,
-                "Attention-group MoE: three depth blocks, one shared and one "
+                "Attention-group MoE: SP-50 with one shared and one "
                 "column-private expert, "
-                f"expert expansion={self.attention_group_moe_expansion_ratio:g}",
+                f"shared expansion={self.attention_group_moe_shared_expansion_ratio:g}, "
+                "aggregate private expansion="
+                f"{self.attention_group_moe_private_active_expansion_ratio:g}",
             )
 
         if self.original_input_width:  # fixed_residual_width entails this
@@ -506,6 +537,8 @@ class WidthVaryingConfig(CommonConfig):
             )
 
         moe_intermediate_size = getattr(self, "moe_intermediate_size", None)
+        self.attention_group_moe_shared_intermediate_sizes: list[int] = []
+        self.attention_group_moe_private_intermediate_sizes: list[int] = []
         h = self.hidden_size
         for i, (attn_block, mlp_block) in enumerate(
             zip(self.sequence_mixer_blocks, self.mlp_blocks)
@@ -528,8 +561,37 @@ class WidthVaryingConfig(CommonConfig):
                 ), "moe_shared_intermediate_size must be -1 (no shared expert)"
                 mlp_block.shared_intermediate_size = None
             elif self.attention_group_moe:
-                mlp_block.intermediate_size = int(
-                    round(width * self.attention_group_moe_expansion_ratio)
+                multiple = self.attention_group_moe_intermediate_multiple
+                shared_size = max(
+                    multiple,
+                    int(
+                        round(
+                            width
+                            * self.attention_group_moe_shared_expansion_ratio
+                            / multiple
+                        )
+                    )
+                    * multiple,
                 )
+                private_evaluations = (
+                    self.attention_num_groups_per_token
+                    if i < self.attention_group_num_layers
+                    else 1
+                )
+                private_size = max(
+                    multiple,
+                    int(
+                        round(
+                            width
+                            * self.attention_group_moe_private_active_expansion_ratio
+                            / private_evaluations
+                            / multiple
+                        )
+                    )
+                    * multiple,
+                )
+                mlp_block.intermediate_size = shared_size
+                self.attention_group_moe_shared_intermediate_sizes.append(shared_size)
+                self.attention_group_moe_private_intermediate_sizes.append(private_size)
             else:
                 mlp_block.intermediate_size = width * 4
