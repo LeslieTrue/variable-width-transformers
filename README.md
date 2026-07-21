@@ -120,21 +120,26 @@ bash pretrain.sh configs/moe_1b3b.yml
 
 ## Attention Groups and Shared/Private Experts
 
-The optional attention-group path uses one top-k router at the entrance of an
-early layer span and reuses its no-drop compact causal dispatch in every layer
-of that span. Set `attention_num_groups`,
-`attention_num_groups_per_token`, `attention_group_num_layers`, and
-`attention_group_heads_per_layer` to configure its routing and per-group
-capacity.
+The optional attention-group path uses one top-k router at the entrance of
+each routed depth block and reuses its no-drop compact causal dispatch in every
+layer of that block. Set `attention_group_depths`,
+`attention_num_groups_by_block`, and
+`attention_num_groups_per_token_by_block` together to configure a hierarchy;
+the depths must sum to `num_layers`. For example, depths `[5, 5, 6]`, groups
+`[8, 4, 1]`, and top-k `[3, 2, 1]` implement `g8k3 -> g4k2 -> g1k1`.
+`attention_group_heads_per_layer` supplies one head count per routed layer (or
+per model layer), while `attention_group_compute_match` can derive it. The old
+`attention_num_groups`, `attention_num_groups_per_token`, and
+`attention_group_num_layers` prefix interface remains supported.
 
 Set `attention_group_moe: true` to pair this with the CORTEX expert layout.
 Every layer then owns one shared SwiGLU expert plus one private expert per
-attention column; single-column later layers own one of each. The learned
+block-local attention column; single-column layers own one of each. The learned
 two-choice expert router mixes the shared output (evaluated once per token)
 with the group-gated private outputs. The SP-50 defaults assign a `2d` hidden
 width to the shared expert and a `2d` aggregate budget to active private
-experts. Consequently, each private expert uses `2d / top_k` in the grouped
-span and `2d` in single-column layers. The active shared-plus-private MLP cost
+experts. Consequently, each private expert uses `2d / top_k` in its block and
+`2d` in single-column layers. The active shared-plus-private MLP cost
 therefore matches one dense `4d` SwiGLU at every depth. Configure the two
 budgets with `attention_group_moe_shared_expansion_ratio` and
 `attention_group_moe_private_active_expansion_ratio`; intermediate widths are

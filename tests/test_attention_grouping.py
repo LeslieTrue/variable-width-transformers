@@ -309,6 +309,67 @@ class TestWidthVaryingAttentionGroupIntegrationTest:
         output.last_hidden_state.square().mean().backward()
         assert model.attention_group_router.gate.weight.grad is not None
 
+    def test_model_refreshes_routing_at_each_grouped_depth_block(self) -> None:
+        """Each routed block should own and backpropagate through its router."""
+
+        template_path = Path(__file__).parents[1] / "configs" / "dense_200m.yml"
+        with template_path.open(encoding="utf-8") as file:
+            model_args = yaml.safe_load(file)["model_args"]["pretrained_config"]
+        model_args.update(
+            hidden_size=64,
+            base_width=64,
+            bottleneck_ratio=1.0,
+            expansion_factor=1.0,
+            reduction_factor=1.0,
+            max_layer=2,
+            num_layers=3,
+            quantize_to=16,
+            max_position_embeddings=8,
+            vocab_size=128,
+            bos_token_id=1,
+            eos_token_id=1,
+            pad_token_id=0,
+            m_width=1,
+            m_emb=1,
+            layer_norm_epsilon=1e-5,
+            attention_num_groups=4,
+            attention_num_groups_per_token=2,
+            attention_group_num_layers=1,
+            attention_group_depths=[1, 1, 1],
+            attention_num_groups_by_block=[4, 2, 1],
+            attention_num_groups_per_token_by_block=[2, 1, 1],
+            attention_group_compute_match=True,
+            attention_group_capacity_multiple=2,
+        )
+        model_args.pop("attention_group_heads_per_layer", None)
+        attention = copy.deepcopy(model_args["sequence_mixer_blocks"][0])
+        attention["num_attention_heads"] = 4
+        attention["num_key_value_heads"] = 4
+        attention["attention_multiplier_method"] = None
+        model_args["sequence_mixer_blocks"] = [
+            copy.deepcopy(attention) for _ in range(3)
+        ]
+        mlp = copy.deepcopy(model_args["mlp_blocks"][0])
+        model_args["mlp_blocks"] = [copy.deepcopy(mlp) for _ in range(3)]
+
+        config = WidthVaryingConfig(**model_args)
+        model = WidthVaryingModel(config)
+        blocks = list(model.h.values())
+        assert [block.attention_group_num_groups for block in blocks] == [4, 2, 1]
+        assert [block.uses_attention_groups for block in blocks] == [True, True, False]
+        assert list(model.attention_group_routers) == ["0", "1"]
+
+        clear_aux_loss()
+        output = model(input_ids=torch.randint(0, 128, (2, 8)), use_cache=False)
+        metrics = model.get_attention_group_metrics()
+        assert metrics["block_0/assignment_shares"].shape == (4,)
+        assert metrics["block_1/assignment_shares"].shape == (2,)
+        output.last_hidden_state.square().mean().backward()
+        assert all(
+            router.gate.weight.grad is not None
+            for router in model.attention_group_routers.values()
+        )
+
     def test_model_builds_three_block_sp50_experts(self) -> None:
         """SP-50 should split dense MLP compute equally across both paths."""
 
@@ -335,6 +396,9 @@ class TestWidthVaryingAttentionGroupIntegrationTest:
             attention_num_groups=4,
             attention_num_groups_per_token=2,
             attention_group_num_layers=1,
+            attention_group_depths=[1, 1, 1],
+            attention_num_groups_by_block=[4, 2, 1],
+            attention_num_groups_per_token_by_block=[2, 1, 1],
             attention_group_compute_match=True,
             attention_group_capacity_multiple=2,
             attention_group_moe=True,
@@ -357,7 +421,7 @@ class TestWidthVaryingAttentionGroupIntegrationTest:
         model = WidthVaryingModel(config)
         blocks = list(model.h.values())
         assert all(isinstance(block.mlp_block, AttentionGroupMoE) for block in blocks)
-        assert [block.mlp_block.num_private_experts for block in blocks] == [4, 1, 1]
+        assert [block.mlp_block.num_private_experts for block in blocks] == [4, 2, 1]
         assert [block.mlp_block.shared_expert.c_proj.in_features for block in blocks] == [
             128,
             128,

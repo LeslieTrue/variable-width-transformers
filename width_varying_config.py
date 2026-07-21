@@ -138,6 +138,9 @@ class WidthVaryingConfig(CommonConfig):
         attention_group_compute_match: bool = False,
         attention_group_capacity_multiple: int = 128,
         attention_group_heads_per_layer: list[int] | None = None,
+        attention_group_depths: list[int] | None = None,
+        attention_num_groups_by_block: list[int] | None = None,
+        attention_num_groups_per_token_by_block: list[int] | None = None,
         attention_group_moe: bool = False,
         attention_group_moe_expansion_ratio: float | None = None,
         attention_group_moe_shared_expansion_ratio: float = 2.0,
@@ -202,6 +205,11 @@ class WidthVaryingConfig(CommonConfig):
         self.attention_group_compute_match = attention_group_compute_match
         self.attention_group_capacity_multiple = attention_group_capacity_multiple
         self.attention_group_heads_per_layer = attention_group_heads_per_layer
+        self.attention_group_depths = attention_group_depths
+        self.attention_num_groups_by_block = attention_num_groups_by_block
+        self.attention_num_groups_per_token_by_block = (
+            attention_num_groups_per_token_by_block
+        )
         self.attention_group_moe = attention_group_moe
         if attention_group_moe_expansion_ratio is not None:
             attention_group_moe_shared_expansion_ratio = (
@@ -439,54 +447,154 @@ class WidthVaryingConfig(CommonConfig):
             else:
                 self.widths = [self.widths[0]] + target_widths + [self.widths[-1]]
 
-        grouping_enabled = self.attention_num_groups > 1
-        if grouping_enabled:
-            if not 1 <= self.attention_num_groups_per_token <= self.attention_num_groups:
-                raise ValueError(
-                    "attention_num_groups_per_token must be in [1, attention_num_groups]"
-                )
+        schedule_values = (
+            self.attention_group_depths,
+            self.attention_num_groups_by_block,
+            self.attention_num_groups_per_token_by_block,
+        )
+        has_explicit_group_schedule = any(value is not None for value in schedule_values)
+        if has_explicit_group_schedule and not all(
+            value is not None for value in schedule_values
+        ):
+            raise ValueError(
+                "attention group block depths, groups, and top-k must be provided together"
+            )
+
+        if has_explicit_group_schedule:
+            assert self.attention_group_depths is not None
+            assert self.attention_num_groups_by_block is not None
+            assert self.attention_num_groups_per_token_by_block is not None
+            block_depths = list(self.attention_group_depths)
+            block_groups = list(self.attention_num_groups_by_block)
+            block_top_k = list(self.attention_num_groups_per_token_by_block)
+        elif self.attention_num_groups > 1:
             if not 1 <= self.attention_group_num_layers <= self.num_layers:
                 raise ValueError(
                     "attention_group_num_layers must be in [1, num_layers] when grouping is enabled"
                 )
-            if self.fixed_residual_width:
-                raise ValueError("attention grouping does not support fixed_residual_width")
-            if self.attention_group_capacity_multiple <= 0:
-                raise ValueError("attention_group_capacity_multiple must be positive")
-
-            dense_heads = [
-                block.num_attention_heads
-                for block in self.sequence_mixer_blocks[: self.attention_group_num_layers]
-            ]
-            if self.attention_group_heads_per_layer is None:
-                self.attention_group_heads_per_layer = resolve_attention_group_head_schedule(
-                    widths=self.widths[: self.attention_group_num_layers],
-                    dense_heads=dense_heads,
-                    sequence_length=self.max_position_embeddings,
-                    num_groups=self.attention_num_groups,
-                    top_k=self.attention_num_groups_per_token,
-                    compute_match=self.attention_group_compute_match,
-                )
-            elif len(self.attention_group_heads_per_layer) != self.attention_group_num_layers:
-                raise ValueError(
-                    "attention_group_heads_per_layer must have attention_group_num_layers entries"
-                )
-            if any(heads <= 0 for heads in self.attention_group_heads_per_layer):
-                raise ValueError("attention group head counts must be positive")
-            log_rank_0(
-                logging.INFO,
-                "Attention grouping: "
-                f"layers={self.attention_group_num_layers}, "
-                f"groups={self.attention_num_groups}, "
-                f"top_k={self.attention_num_groups_per_token}, "
-                f"heads={self.attention_group_heads_per_layer}",
-            )
+            block_depths = [self.attention_group_num_layers]
+            block_groups = [self.attention_num_groups]
+            block_top_k = [self.attention_num_groups_per_token]
+            remaining_layers = self.num_layers - self.attention_group_num_layers
+            if remaining_layers:
+                block_depths.append(remaining_layers)
+                block_groups.append(1)
+                block_top_k.append(1)
         else:
             if self.attention_group_num_layers != 0:
                 raise ValueError(
                     "attention_group_num_layers must be 0 when attention_num_groups == 1"
                 )
+            block_depths = [self.num_layers]
+            block_groups = [1]
+            block_top_k = [1]
+
+        if not block_depths or not (
+            len(block_depths) == len(block_groups) == len(block_top_k)
+        ):
+            raise ValueError("attention group block schedules must be nonempty and aligned")
+        if any(depth <= 0 for depth in block_depths) or sum(block_depths) != self.num_layers:
+            raise ValueError("attention group block depths must be positive and sum to num_layers")
+        if any(
+            groups <= 0 or not 1 <= top_k <= groups
+            for groups, top_k in zip(block_groups, block_top_k)
+        ):
+            raise ValueError("every attention group block must satisfy 1 <= top_k <= groups")
+        if any(groups == 1 and top_k != 1 for groups, top_k in zip(block_groups, block_top_k)):
+            raise ValueError("one-group attention blocks must use top_k=1")
+
+        self.attention_group_depths = block_depths
+        self.attention_num_groups_by_block = block_groups
+        self.attention_num_groups_per_token_by_block = block_top_k
+        self.attention_group_block_starts: list[int] = []
+        self.attention_group_block_index_per_layer: list[int] = []
+        self.attention_num_groups_per_layer: list[int] = []
+        self.attention_num_groups_per_token_per_layer: list[int] = []
+        block_start = 0
+        for block_index, (depth, groups, top_k) in enumerate(
+            zip(block_depths, block_groups, block_top_k)
+        ):
+            self.attention_group_block_starts.append(block_start)
+            self.attention_group_block_index_per_layer.extend([block_index] * depth)
+            self.attention_num_groups_per_layer.extend([groups] * depth)
+            self.attention_num_groups_per_token_per_layer.extend([top_k] * depth)
+            block_start += depth
+
+        routed_layer_indices = [
+            layer_index
+            for layer_index, groups in enumerate(self.attention_num_groups_per_layer)
+            if groups > 1
+        ]
+        self.attention_group_router_layers = [
+            start
+            for start, groups in zip(
+                self.attention_group_block_starts,
+                self.attention_num_groups_by_block,
+            )
+            if groups > 1
+        ]
+        grouping_enabled = bool(routed_layer_indices)
+        if grouping_enabled:
+            if self.fixed_residual_width:
+                raise ValueError("attention grouping does not support fixed_residual_width")
+            if self.attention_group_capacity_multiple <= 0:
+                raise ValueError("attention_group_capacity_multiple must be positive")
+
+            dense_heads_by_layer = [
+                block.num_attention_heads for block in self.sequence_mixer_blocks
+            ]
+            if self.attention_group_heads_per_layer is None:
+                heads_by_layer = dense_heads_by_layer.copy()
+                for start, depth, groups, top_k in zip(
+                    self.attention_group_block_starts,
+                    self.attention_group_depths,
+                    self.attention_num_groups_by_block,
+                    self.attention_num_groups_per_token_by_block,
+                ):
+                    if groups == 1:
+                        continue
+                    stop = start + depth
+                    heads_by_layer[start:stop] = resolve_attention_group_head_schedule(
+                        widths=self.widths[start:stop],
+                        dense_heads=dense_heads_by_layer[start:stop],
+                        sequence_length=self.max_position_embeddings,
+                        num_groups=groups,
+                        top_k=top_k,
+                        compute_match=self.attention_group_compute_match,
+                    )
+            else:
+                provided_heads = list(self.attention_group_heads_per_layer)
+                if len(provided_heads) == self.num_layers:
+                    heads_by_layer = provided_heads
+                elif len(provided_heads) == len(routed_layer_indices):
+                    heads_by_layer = dense_heads_by_layer.copy()
+                    for layer_index, heads in zip(routed_layer_indices, provided_heads):
+                        heads_by_layer[layer_index] = heads
+                else:
+                    raise ValueError(
+                        "attention_group_heads_per_layer must have one entry per routed layer or model layer"
+                    )
+            if any(heads_by_layer[index] <= 0 for index in routed_layer_indices):
+                raise ValueError("attention group head counts must be positive")
+            self.attention_group_heads_by_layer = heads_by_layer
+            self.attention_group_heads_per_layer = [
+                heads_by_layer[index] for index in routed_layer_indices
+            ]
+            log_rank_0(
+                logging.INFO,
+                "Attention grouping blocks: "
+                f"depths={self.attention_group_depths}, "
+                f"groups={self.attention_num_groups_by_block}, "
+                f"top_k={self.attention_num_groups_per_token_by_block}, "
+                f"routed_heads={self.attention_group_heads_per_layer}",
+            )
+        else:
+            if self.attention_group_heads_per_layer not in (None, []):
+                raise ValueError("dense attention schedules cannot specify grouped heads")
             self.attention_group_heads_per_layer = []
+            self.attention_group_heads_by_layer = [
+                block.num_attention_heads for block in self.sequence_mixer_blocks
+            ]
 
         if self.attention_group_moe:
             if not grouping_enabled:
@@ -574,9 +682,7 @@ class WidthVaryingConfig(CommonConfig):
                     * multiple,
                 )
                 private_evaluations = (
-                    self.attention_num_groups_per_token
-                    if i < self.attention_group_num_layers
-                    else 1
+                    self.attention_num_groups_per_token_per_layer[i]
                 )
                 private_size = max(
                     multiple,

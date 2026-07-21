@@ -94,7 +94,16 @@ class WidthVaryingBlock(Block):
             self.rope_dim, max_position_embeddings=max_position_embeddings, base=config.rope_theta
         )
         self.use_padding_free_transformer = use_padding_free_transformer
-        self.uses_attention_groups = layer_idx < config.attention_group_num_layers
+        self.attention_group_block_index = (
+            config.attention_group_block_index_per_layer[layer_idx]
+        )
+        self.attention_group_num_groups = config.attention_num_groups_per_layer[
+            layer_idx
+        ]
+        self.attention_group_top_k = (
+            config.attention_num_groups_per_token_per_layer[layer_idx]
+        )
+        self.uses_attention_groups = self.attention_group_num_groups > 1
 
         if self.uses_attention_groups:
             if use_padding_free_transformer or sequence_parallel:
@@ -113,8 +122,8 @@ class WidthVaryingBlock(Block):
             self.attention_group_router_std = float(dense_attention.c_attn.std)
             self.sequence_mixer = GroupedSelfAttention(
                 hidden_size=self.hidden_size,
-                num_groups=config.attention_num_groups,
-                group_heads=config.attention_group_heads_per_layer[layer_idx],
+                num_groups=self.attention_group_num_groups,
+                group_heads=config.attention_group_heads_by_layer[layer_idx],
                 head_dim=self.rope_dim,
                 attention_multiplier=dense_attention.attention_multiplier,
                 add_bias=dense_attention.add_bias,
@@ -156,9 +165,7 @@ class WidthVaryingBlock(Block):
 
             self.mlp_block = AttentionGroupMoE(
                 hidden_size=self.hidden_size,
-                num_private_experts=(
-                    config.attention_num_groups if self.uses_attention_groups else 1
-                ),
+                num_private_experts=self.attention_group_num_groups,
                 shared_expert=shared_expert,
                 private_expert_factory=make_private_expert,
                 router_std=float(shared_expert.c_fc.std),
@@ -617,19 +624,19 @@ class WidthVaryingModel(GPTBaseModel):
 
         super()._init_model(config, **kwargs)
 
-        self.attention_group_router: AttentionGroupRouter | None = None
+        self.attention_group_routers = nn.ModuleDict()
         self._attention_group_metrics: dict[str, torch.Tensor] = {}
-        if config.attention_group_num_layers > 0:
-            grouped_blocks = list(self.h.values())[: config.attention_group_num_layers]
-            if len(grouped_blocks) != config.attention_group_num_layers:
+        model_blocks = list(self.h.values())
+        for layer_index in config.attention_group_router_layers:
+            if layer_index >= len(model_blocks):
                 raise ValueError("all grouped layers must reside on the current pipeline stage")
-            router_std = grouped_blocks[0].attention_group_router_std
-            self.attention_group_router = AttentionGroupRouter(
-                input_width=config.widths[0],
-                num_groups=config.attention_num_groups,
-                top_k=config.attention_num_groups_per_token,
+            grouped_block = model_blocks[layer_index]
+            self.attention_group_routers[str(layer_index)] = AttentionGroupRouter(
+                input_width=config.widths[layer_index],
+                num_groups=config.attention_num_groups_per_layer[layer_index],
+                top_k=config.attention_num_groups_per_token_per_layer[layer_index],
                 capacity_multiple=config.attention_group_capacity_multiple,
-                std=router_std,
+                std=grouped_block.attention_group_router_std,
             )
 
         # Handle embedding_width: recreate wte with embedding_width instead of hidden_size
@@ -812,7 +819,7 @@ class WidthVaryingModel(GPTBaseModel):
                 else cache_params
             )
 
-        if self.attention_group_router is not None and (
+        if self.attention_group_routers and (
             cache_params is not None or cu_seqlens is not None
         ):
             raise ValueError("attention grouping currently supports fixed-length pretraining only")
@@ -863,14 +870,26 @@ class WidthVaryingModel(GPTBaseModel):
                     self.config.sinkhorn_iters,
                 )
 
-            if layer_idx == 0 and self.attention_group_router is not None:
-                attention_group_plan = self.attention_group_router(hidden_states)
-                self._attention_group_metrics = {
+            router_key = str(layer_idx)
+            if router_key in self.attention_group_routers:
+                attention_group_plan = self.attention_group_routers[router_key](
+                    hidden_states
+                )
+                block_index = block.attention_group_block_index
+                block_metrics = {
                     "assignment_shares": attention_group_plan.assignment_shares,
                     "entropy": attention_group_plan.entropy,
                     "balance": attention_group_plan.balance,
                     "max_capacity_ratio": attention_group_plan.max_capacity_ratio,
                 }
+                self._attention_group_metrics.update(
+                    {
+                        f"block_{block_index}/{name}": value
+                        for name, value in block_metrics.items()
+                    }
+                )
+                if block_index == 0:
+                    self._attention_group_metrics.update(block_metrics)
 
             hidden_states = block(
                 hidden_states,
@@ -926,12 +945,25 @@ class WidthVaryingModel(GPTBaseModel):
             last_hidden_state=hidden_states, cache_params=cache_params
         )
 
+    @property
+    def attention_group_router(self) -> AttentionGroupRouter | None:
+        """Return the first router for compatibility with prefix-only callers.
+
+        Returns:
+            AttentionGroupRouter | None: First routed-block router, or ``None``
+            for a dense model.
+        """
+
+        return next(iter(self.attention_group_routers.values()), None)
+
     def get_attention_group_metrics(self) -> dict[str, torch.Tensor]:
-        """Return detached diagnostics from the most recent routing decision.
+        """Return detached diagnostics from the most recent routing decisions.
 
         Returns:
             dict[str, torch.Tensor]: Assignment shares, entropy, balance, and
-            maximum capacity inflation. The dictionary is empty for dense models.
+            maximum capacity inflation. Multi-block schedules additionally use
+            ``block_N/``-prefixed names; the first block retains unprefixed keys
+            for compatibility. The dictionary is empty for dense models.
         """
 
         return self._attention_group_metrics.copy()
