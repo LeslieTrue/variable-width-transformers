@@ -10,8 +10,10 @@ import yaml
 
 from attention_grouping import (
     AttentionGroupMoE,
+    AttentionGroupPooledMoE,
     AttentionGroupRouter,
     GroupedSelfAttention,
+    MaskedExpertPool,
     attention_group_flop_ratio,
     dense_attention_flops,
     grouped_attention_flops,
@@ -20,6 +22,51 @@ from attention_grouping import (
 from lm_engine.hf_models.loss import clear_aux_loss, get_aux_loss
 from width_varying_config import WidthVaryingConfig
 from width_varying_model import WidthVaryingModel
+
+
+def _make_masked_pool(
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int = 2,
+    experts_per_token: int = 1,
+    auxiliary_loss_scale: float = 1.0,
+) -> MaskedExpertPool:
+    """Build a small bias-free SwiGLU pool for CPU reference tests.
+
+    Args:
+        hidden_size (int): Input and output width.
+        intermediate_size (int): Per-expert SwiGLU width.
+        num_experts (int): Stored experts.
+        experts_per_token (int): Selected experts per token.
+        auxiliary_loss_scale (float): Router auxiliary-loss multiplier.
+
+    Returns:
+        MaskedExpertPool: Initialized native VWT expert pool.
+    """
+
+    return MaskedExpertPool(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        shared_intermediate_size=None,
+        use_interleaved_weights_for_shared_experts=False,
+        use_interleaved_weights=False,
+        shared_expert_gating=False,
+        normalized_topk=True,
+        num_experts=num_experts,
+        num_experts_per_tok=experts_per_token,
+        add_bias=False,
+        activation_function="swiglu",
+        dropout=0.0,
+        init_method="mup",
+        initializer_range=0.1,
+        m_width=1,
+        num_layers=2,
+        use_depth_scaled_init=True,
+        use_padding_free_transformer=False,
+        sequence_parallel=False,
+        auxiliary_loss_scale=auxiliary_loss_scale,
+    )
 
 
 class TestAttentionGroupFlopsTest:
@@ -250,6 +297,103 @@ class TestAttentionGroupMoETest:
         torch.testing.assert_close(module(x), expected)
 
 
+class TestMaskedExpertPoolTest:
+    """Reference tests for valid-token expert-pool dispatch."""
+
+    def test_masked_padding_matches_unpadded_pool(self) -> None:
+        """Capacity-padding rows should neither change nor receive outputs."""
+
+        torch.manual_seed(13)
+        pool = _make_masked_pool(hidden_size=4, intermediate_size=8).eval()
+        valid_x = torch.randn(1, 3, 4)
+        padded_x = torch.cat([valid_x, torch.randn(1, 2, 4)], dim=1)
+        valid_mask = torch.tensor([[True, True, True, False, False]])
+
+        expected = pool(valid_x)
+        actual = pool(padded_x, valid_mask=valid_mask)
+
+        torch.testing.assert_close(actual[:, :3], expected)
+        assert torch.count_nonzero(actual[:, 3:]) == 0
+
+    def test_masked_training_adds_sequence_granular_aux_loss(self) -> None:
+        """Sparse pool balancing should ignore padding and remain per sequence."""
+
+        torch.manual_seed(17)
+        clear_aux_loss()
+        pool = _make_masked_pool(
+            hidden_size=4,
+            intermediate_size=8,
+            num_experts=3,
+            experts_per_token=2,
+            auxiliary_loss_scale=0.5,
+        ).train()
+        x = torch.randn(2, 4, 4, requires_grad=True)
+        valid_mask = torch.tensor(
+            [[True, True, False, False], [True, True, True, False]]
+        )
+
+        output = pool(x, valid_mask=valid_mask)
+        auxiliary_loss = get_aux_loss()
+
+        assert auxiliary_loss.shape == (2,)
+        assert torch.isfinite(auxiliary_loss).all()
+        assert torch.count_nonzero(output[~valid_mask]) == 0
+        output.square().sum().backward()
+        assert pool.gate.weight.grad is not None
+        assert pool.c_fc.weight.grad is not None
+        assert pool.c_proj.weight.grad is not None
+
+
+class TestAttentionGroupPooledMoETest:
+    """Reference tests for public and group-private expert pools."""
+
+    def test_sparse_pools_match_explicit_group_sum(self) -> None:
+        """Pooled dispatch should match a slow unpadded group reference."""
+
+        torch.manual_seed(19)
+        router = AttentionGroupRouter(
+            input_width=4,
+            num_groups=2,
+            top_k=2,
+            capacity_multiple=1,
+            std=0.1,
+        ).eval()
+        module = AttentionGroupPooledMoE(
+            hidden_size=4,
+            num_private_groups=2,
+            public_pool=_make_masked_pool(
+                hidden_size=4, intermediate_size=8
+            ),
+            private_pool_factory=lambda: _make_masked_pool(
+                hidden_size=4,
+                intermediate_size=4,
+                auxiliary_loss_scale=0.5,
+            ),
+            router_std=0.1,
+        ).eval()
+        x = torch.randn(1, 4, 4, requires_grad=True)
+        plan = router(x)
+
+        actual = module(x, plan)
+        path_gates = torch.softmax(
+            module.public_private_gate(x).float(), dim=-1
+        ).type_as(x)
+        reference = module.public_pool(x) * path_gates[..., :1]
+        for pool, entry in zip(module.private_pools, plan.entries):
+            valid = entry.valid_mask[0]
+            indices = entry.gather_indices[0, valid]
+            weights = entry.gates[0, valid] * path_gates[0, indices, 1]
+            reference[0, indices] += (
+                pool(x[:, indices])[0] * weights.unsqueeze(-1)
+            )
+
+        torch.testing.assert_close(actual, reference)
+        actual.square().sum().backward()
+        assert module.public_private_gate.weight.grad is not None
+        assert module.public_pool.c_fc.weight.grad is not None
+        assert all(pool.c_fc.weight.grad is not None for pool in module.private_pools)
+
+
 class TestWidthVaryingAttentionGroupIntegrationTest:
     """End-to-end tests for shared routing through the VWT model."""
 
@@ -437,3 +581,87 @@ class TestWidthVaryingAttentionGroupIntegrationTest:
         output = model(input_ids=torch.randint(0, 128, (2, 8)), use_cache=False)
         output.last_hidden_state.square().mean().backward()
         assert all(block.mlp_block.expert_gate.weight.grad is not None for block in blocks)
+
+    def test_model_builds_prefix_public_private_expert_pools(self) -> None:
+        """Only grouped prefix layers should replace their dense MLP."""
+
+        template_path = Path(__file__).parents[1] / "configs" / "dense_200m.yml"
+        with template_path.open(encoding="utf-8") as file:
+            model_args = yaml.safe_load(file)["model_args"]["pretrained_config"]
+        model_args.update(
+            hidden_size=64,
+            base_width=64,
+            bottleneck_ratio=1.0,
+            expansion_factor=1.0,
+            reduction_factor=1.0,
+            max_layer=2,
+            num_layers=3,
+            quantize_to=16,
+            max_position_embeddings=8,
+            vocab_size=128,
+            bos_token_id=1,
+            eos_token_id=1,
+            pad_token_id=0,
+            m_width=1,
+            m_emb=1,
+            layer_norm_epsilon=1e-5,
+            attention_num_groups=4,
+            attention_num_groups_per_token=2,
+            attention_group_num_layers=1,
+            attention_group_compute_match=True,
+            attention_group_capacity_multiple=2,
+            attention_group_pooled_moe=True,
+            attention_group_public_experts=4,
+            attention_group_public_experts_per_token=1,
+            attention_group_private_experts_per_group=3,
+            attention_group_private_experts_per_token=1,
+            attention_group_pooled_moe_public_active_expansion_ratio=2.0,
+            attention_group_pooled_moe_private_active_expansion_ratio=2.0,
+            attention_group_pooled_moe_intermediate_multiple=8,
+        )
+        model_args.pop("attention_group_heads_per_layer", None)
+        attention = copy.deepcopy(model_args["sequence_mixer_blocks"][0])
+        attention["num_attention_heads"] = 4
+        attention["num_key_value_heads"] = 4
+        attention["attention_multiplier_method"] = None
+        model_args["sequence_mixer_blocks"] = [
+            copy.deepcopy(attention) for _ in range(3)
+        ]
+        mlp = copy.deepcopy(model_args["mlp_blocks"][0])
+        model_args["mlp_blocks"] = [copy.deepcopy(mlp) for _ in range(3)]
+
+        config = WidthVaryingConfig(**model_args)
+        model = WidthVaryingModel(config)
+        blocks = list(model.h.values())
+
+        assert isinstance(blocks[0].mlp_block, AttentionGroupPooledMoE)
+        assert not isinstance(blocks[1].mlp_block, AttentionGroupPooledMoE)
+        assert not isinstance(blocks[2].mlp_block, AttentionGroupPooledMoE)
+        assert blocks[0].mlp_block.public_pool.num_experts == 4
+        assert len(blocks[0].mlp_block.private_pools) == 4
+        assert all(
+            pool.num_experts == 3
+            for pool in blocks[0].mlp_block.private_pools
+        )
+        assert config.attention_group_pooled_moe_public_intermediate_sizes == [
+            128,
+            0,
+            0,
+        ]
+        assert config.attention_group_pooled_moe_private_intermediate_sizes == [
+            64,
+            0,
+            0,
+        ]
+
+        clear_aux_loss()
+        output = model(input_ids=torch.randint(0, 128, (2, 8)), use_cache=False)
+        auxiliary_loss = get_aux_loss()
+        assert auxiliary_loss.shape == (2,)
+        assert torch.isfinite(auxiliary_loss).all()
+        output.last_hidden_state.square().mean().backward()
+        assert blocks[0].mlp_block.public_pool.gate.weight.grad is not None
+        assert all(
+            pool.gate.weight.grad is not None
+            for pool in blocks[0].mlp_block.private_pools
+        )

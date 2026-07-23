@@ -146,6 +146,14 @@ class WidthVaryingConfig(CommonConfig):
         attention_group_moe_shared_expansion_ratio: float = 2.0,
         attention_group_moe_private_active_expansion_ratio: float = 2.0,
         attention_group_moe_intermediate_multiple: int = 8,
+        attention_group_pooled_moe: bool = False,
+        attention_group_public_experts: int = 4,
+        attention_group_public_experts_per_token: int = 1,
+        attention_group_private_experts_per_group: int = 4,
+        attention_group_private_experts_per_token: int = 1,
+        attention_group_pooled_moe_public_active_expansion_ratio: float = 2.0,
+        attention_group_pooled_moe_private_active_expansion_ratio: float = 2.0,
+        attention_group_pooled_moe_intermediate_multiple: int = 8,
         **kwargs,
     ) -> None:
         # Automatically determine schedule type based on which parameters are provided
@@ -227,6 +235,26 @@ class WidthVaryingConfig(CommonConfig):
         )
         self.attention_group_moe_intermediate_multiple = (
             attention_group_moe_intermediate_multiple
+        )
+        self.attention_group_pooled_moe = attention_group_pooled_moe
+        self.attention_group_public_experts = attention_group_public_experts
+        self.attention_group_public_experts_per_token = (
+            attention_group_public_experts_per_token
+        )
+        self.attention_group_private_experts_per_group = (
+            attention_group_private_experts_per_group
+        )
+        self.attention_group_private_experts_per_token = (
+            attention_group_private_experts_per_token
+        )
+        self.attention_group_pooled_moe_public_active_expansion_ratio = (
+            attention_group_pooled_moe_public_active_expansion_ratio
+        )
+        self.attention_group_pooled_moe_private_active_expansion_ratio = (
+            attention_group_pooled_moe_private_active_expansion_ratio
+        )
+        self.attention_group_pooled_moe_intermediate_multiple = (
+            attention_group_pooled_moe_intermediate_multiple
         )
         if sinkhorn_iters > 0:
             assert expand_method in ["linear", "linear_diff"], (
@@ -597,6 +625,10 @@ class WidthVaryingConfig(CommonConfig):
             ]
 
         if self.attention_group_moe:
+            if self.attention_group_pooled_moe:
+                raise ValueError(
+                    "attention_group_moe and attention_group_pooled_moe are exclusive"
+                )
             if not grouping_enabled:
                 raise ValueError("attention_group_moe requires attention grouping")
             if self.num_layers < 3:
@@ -627,6 +659,62 @@ class WidthVaryingConfig(CommonConfig):
                 f"{self.attention_group_moe_private_active_expansion_ratio:g}",
             )
 
+        if self.attention_group_pooled_moe:
+            if not grouping_enabled:
+                raise ValueError(
+                    "attention_group_pooled_moe requires attention grouping"
+                )
+            if self.attention_group_public_experts <= 1:
+                raise ValueError("the public expert pool must contain at least 2 experts")
+            if not (
+                1
+                <= self.attention_group_public_experts_per_token
+                <= self.attention_group_public_experts
+            ):
+                raise ValueError("invalid public expert top-k")
+            if self.attention_group_private_experts_per_group <= 1:
+                raise ValueError("each private pool must contain at least 2 experts")
+            if not (
+                1
+                <= self.attention_group_private_experts_per_token
+                <= self.attention_group_private_experts_per_group
+            ):
+                raise ValueError("invalid private expert top-k")
+            if (
+                self.attention_group_pooled_moe_public_active_expansion_ratio
+                <= 0
+            ):
+                raise ValueError("public active expansion ratio must be positive")
+            if (
+                self.attention_group_pooled_moe_private_active_expansion_ratio
+                <= 0
+            ):
+                raise ValueError("private active expansion ratio must be positive")
+            if self.attention_group_pooled_moe_intermediate_multiple <= 0:
+                raise ValueError("pooled expert intermediate multiple must be positive")
+            for mlp_block in self.mlp_blocks:
+                if getattr(mlp_block, "mlp_type", None) != "MLP":
+                    raise ValueError(
+                        "attention_group_pooled_moe requires native dense MLP blocks"
+                    )
+                if getattr(mlp_block, "activation_function", None) != "swiglu":
+                    raise ValueError(
+                        "attention_group_pooled_moe requires SwiGLU experts"
+                    )
+                if getattr(mlp_block, "add_bias", False):
+                    raise ValueError(
+                        "attention_group_pooled_moe currently requires bias-free MLPs"
+                    )
+            log_rank_0(
+                logging.INFO,
+                "Prefix attention-group pooled MoE: "
+                f"public={self.attention_group_public_experts}"
+                f"k{self.attention_group_public_experts_per_token}, "
+                "private/group="
+                f"{self.attention_group_private_experts_per_group}"
+                f"k{self.attention_group_private_experts_per_token}",
+            )
+
         if self.original_input_width:  # fixed_residual_width entails this
             self.embedding_width = self.hidden_size
         else:
@@ -647,6 +735,8 @@ class WidthVaryingConfig(CommonConfig):
         moe_intermediate_size = getattr(self, "moe_intermediate_size", None)
         self.attention_group_moe_shared_intermediate_sizes: list[int] = []
         self.attention_group_moe_private_intermediate_sizes: list[int] = []
+        self.attention_group_pooled_moe_public_intermediate_sizes: list[int] = []
+        self.attention_group_pooled_moe_private_intermediate_sizes: list[int] = []
         h = self.hidden_size
         for i, (attn_block, mlp_block) in enumerate(
             zip(self.sequence_mixer_blocks, self.mlp_blocks)
@@ -701,3 +791,45 @@ class WidthVaryingConfig(CommonConfig):
                 self.attention_group_moe_private_intermediate_sizes.append(private_size)
             else:
                 mlp_block.intermediate_size = width * 4
+            if (
+                self.attention_group_pooled_moe
+                and self.attention_num_groups_per_layer[i] > 1
+            ):
+                multiple = self.attention_group_pooled_moe_intermediate_multiple
+                public_size = max(
+                    multiple,
+                    int(
+                        round(
+                            width
+                            * self.attention_group_pooled_moe_public_active_expansion_ratio
+                            / self.attention_group_public_experts_per_token
+                            / multiple
+                        )
+                    )
+                    * multiple,
+                )
+                private_evaluations = (
+                    self.attention_num_groups_per_token_per_layer[i]
+                    * self.attention_group_private_experts_per_token
+                )
+                private_size = max(
+                    multiple,
+                    int(
+                        round(
+                            width
+                            * self.attention_group_pooled_moe_private_active_expansion_ratio
+                            / private_evaluations
+                            / multiple
+                        )
+                    )
+                    * multiple,
+                )
+            else:
+                public_size = 0
+                private_size = 0
+            self.attention_group_pooled_moe_public_intermediate_sizes.append(
+                public_size
+            )
+            self.attention_group_pooled_moe_private_intermediate_sizes.append(
+                private_size
+            )

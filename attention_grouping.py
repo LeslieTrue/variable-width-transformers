@@ -25,6 +25,7 @@ from lm_engine.hf_models.modeling_utils.position_embedding.rope import (
 )
 from lm_engine.hf_models.parameter import mark_parameter_as_mup_learning_rate
 from lm_engine.utils import ProcessGroupManager
+from masked_expert_pool import MaskedExpertPool
 
 
 def dense_attention_flops(*, sequence_length: int, width: int) -> float:
@@ -596,6 +597,134 @@ class AttentionGroupMoE(nn.Module):
                 x, expert_gates[..., 1], dispatch_plan
             )
         return shared_update + private_update
+
+
+class AttentionGroupPooledMoE(nn.Module):
+    """Public and attention-group-private pools with sparse expert selection.
+
+    A global public pool is evaluated once per token. Each attention group owns
+    an independent private pool evaluated only for tokens dispatched to that
+    group. A learned two-way gate mixes the public and aggregate private paths;
+    normalized top-k gates inside each pool select its active experts.
+
+    Attributes:
+        hidden_size (int): Input and output token width.
+        num_private_groups (int): Number of private attention-group pools.
+        public_pool (MaskedExpertPool): Expert pool shared by all tokens.
+        private_pools (nn.ModuleList): One independent expert pool per group.
+        public_private_gate (ParameterizedLinear): Two-logit path mixer.
+    """
+
+    hidden_size: int
+    num_private_groups: int
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        num_private_groups: int,
+        public_pool: MaskedExpertPool,
+        private_pool_factory: Callable[[], MaskedExpertPool],
+        router_std: float,
+    ) -> None:
+        """Initialize public and group-private expert pools.
+
+        Args:
+            hidden_size (int): Residual width.
+            num_private_groups (int): Number of attention groups.
+            public_pool (MaskedExpertPool): Globally accessible pool.
+            private_pool_factory (Callable[[], MaskedExpertPool]): Factory
+                returning an independently initialized private pool.
+            router_std (float): Standard deviation for the two-way path gate.
+        """
+
+        super().__init__()
+        if hidden_size <= 0 or num_private_groups <= 1:
+            raise ValueError("pooled MoE requires positive width and multiple groups")
+        self.hidden_size = hidden_size
+        self.num_private_groups = num_private_groups
+        self.public_pool = public_pool
+        self.private_pools = nn.ModuleList(
+            [private_pool_factory() for _ in range(num_private_groups)]
+        )
+        self.public_private_gate = ParameterizedLinear(
+            hidden_size, 2, bias=False, std=router_std
+        )
+        mark_parameter_as_mup_learning_rate(self.public_private_gate.weight)
+
+    @torch.compiler.disable
+    def _private_update(
+        self,
+        x: torch.Tensor,
+        private_gate: torch.Tensor,
+        dispatch_plan: AttentionGroupDispatchPlan,
+    ) -> torch.Tensor:
+        """Apply each private pool to its attention-group compact sequence.
+
+        Args:
+            x (torch.Tensor): Normalized tokens, shape
+                ``[batch, sequence, hidden]``.
+            private_gate (torch.Tensor): Private-path mixture coefficient,
+                shape ``[batch, sequence]``.
+            dispatch_plan (AttentionGroupDispatchPlan): Shared attention-group
+                routing and compact-capacity layout.
+
+        Returns:
+            torch.Tensor: Gate-weighted aggregate private update, shape
+            ``[batch, sequence, hidden]``.
+        """
+
+        if len(dispatch_plan.entries) != self.num_private_groups:
+            raise ValueError("dispatch plan does not match private pool count")
+        batch_size, sequence_length, _ = x.shape
+        output = x.new_zeros(batch_size, sequence_length, self.hidden_size)
+        for pool, entry in zip(self.private_pools, dispatch_plan.entries):
+            capacity = entry.gather_indices.shape[1]
+            if capacity == 0:
+                continue
+            gather_index = entry.gather_indices.unsqueeze(-1).expand(
+                -1, -1, self.hidden_size
+            )
+            compact_x = torch.gather(x, dim=1, index=gather_index)
+            compact_output = pool(compact_x, valid_mask=entry.valid_mask)
+            compact_private_gate = torch.gather(
+                private_gate, dim=1, index=entry.gather_indices
+            )
+            compact_weight = entry.gates * compact_private_gate
+            compact_output = compact_output * compact_weight.unsqueeze(-1)
+            output.scatter_add_(dim=1, index=gather_index, src=compact_output)
+        return output
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        dispatch_plan: AttentionGroupDispatchPlan,
+    ) -> torch.Tensor:
+        """Select public/private experts and return their mixed update.
+
+        Args:
+            x (torch.Tensor): Normalized tokens, shape
+                ``[batch, sequence, hidden]``.
+            dispatch_plan (AttentionGroupDispatchPlan): Prefix attention-group
+                routing plan reused for private-pool dispatch.
+
+        Returns:
+            torch.Tensor: Routed MLP update, shape
+            ``[batch, sequence, hidden]``.
+        """
+
+        if x.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"pooled MLP expected width {self.hidden_size}, got {x.shape[-1]}"
+            )
+        path_gates = F.softmax(
+            self.public_private_gate(x).float(), dim=-1
+        ).type_as(x)
+        public_update = self.public_pool(x) * path_gates[..., :1]
+        private_update = self._private_update(
+            x, path_gates[..., 1], dispatch_plan
+        )
+        return public_update + private_update
 
 
 class _AttentionGroupProjection(nn.Module):

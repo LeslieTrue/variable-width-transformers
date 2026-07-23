@@ -22,14 +22,15 @@ from lm_engine.hf_models.modeling_utils.linear import ParameterizedLinear
 from lm_engine.hf_models.modeling_utils.normalization import get_normalization_function
 from lm_engine.hf_models.modeling_utils.position_embedding.rope import RoPE
 from lm_engine.hf_models.modeling_utils import ParameterizedEmbedding
-from lm_engine.hf_models.modeling_utils.mlp_blocks import get_mlp_block
 from lm_engine.hf_models.utils import is_generation_cache_enabled
 from lm_engine.hf_models.parameter import mark_parameter_as_mup_learning_rate
 from lm_engine.utils import log_rank_0
 
+from attention_group_mlp_factory import build_attention_group_mlp
 from attention_grouping import (
     AttentionGroupDispatchPlan,
     AttentionGroupMoE,
+    AttentionGroupPooledMoE,
     AttentionGroupRouter,
     GroupedSelfAttention,
 )
@@ -133,43 +134,19 @@ class WidthVaryingBlock(Block):
                 out_std=float(dense_attention.c_proj.std),
             )
 
-        if config.attention_group_moe:
-            shared_expert = self.mlp_block
-            mlp_config = config.mlp_blocks[layer_idx]
-            private_intermediate_size = (
-                config.attention_group_moe_private_intermediate_sizes[layer_idx]
-            )
-
-            def make_private_expert() -> nn.Module:
-                """Build one independently initialized private VWT expert.
-
-                Returns:
-                    nn.Module: SwiGLU expert with the layer's SP-50 private width.
-                """
-
-                config.hidden_size = self.hidden_size
-                config.initializer_range = layer_initializer_range
-                original_intermediate_size = mlp_config.intermediate_size
-                mlp_config.intermediate_size = private_intermediate_size
-                try:
-                    return get_mlp_block(
-                        config,
-                        use_padding_free_transformer,
-                        sequence_parallel,
-                        layer_idx,
-                    )
-                finally:
-                    mlp_config.intermediate_size = original_intermediate_size
-                    config.hidden_size = orig_hidden_size
-                    config.initializer_range = orig_initializer_range
-
-            self.mlp_block = AttentionGroupMoE(
-                hidden_size=self.hidden_size,
-                num_private_experts=self.attention_group_num_groups,
-                shared_expert=shared_expert,
-                private_expert_factory=make_private_expert,
-                router_std=float(shared_expert.c_fc.std),
-            )
+        self.mlp_block = build_attention_group_mlp(
+            config=config,
+            layer_idx=layer_idx,
+            hidden_size=self.hidden_size,
+            num_groups=self.attention_group_num_groups,
+            uses_attention_groups=self.uses_attention_groups,
+            dense_expert=self.mlp_block,
+            layer_initializer_range=layer_initializer_range,
+            original_hidden_size=orig_hidden_size,
+            original_initializer_range=orig_initializer_range,
+            use_padding_free_transformer=use_padding_free_transformer,
+            sequence_parallel=sequence_parallel,
+        )
 
         # If fixed_residual_width is enabled, replace normalization layers and wrap attention/MLP
         if self.fixed_residual_width:
@@ -302,7 +279,9 @@ class WidthVaryingBlock(Block):
         hidden_states = hidden_states + residual
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
-        if isinstance(self.mlp_block, AttentionGroupMoE):
+        if isinstance(
+            self.mlp_block, (AttentionGroupMoE, AttentionGroupPooledMoE)
+        ):
             hidden_states = self.mlp_block(hidden_states, attention_group_plan)
         else:
             hidden_states = self.mlp_block(hidden_states)
